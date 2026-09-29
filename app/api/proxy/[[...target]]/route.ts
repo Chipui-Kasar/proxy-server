@@ -1,13 +1,18 @@
 import type { NextRequest } from "next/server";
 
 /**
- * Route: /api/proxy/[...target]
+ * Route: /api/proxy/[[...target]]
  *
  * Generic passthrough proxy for third-party APIs that can't be called
  * directly from the browser (CORS). Any HTTPS host is proxied.
  *
- * Usage:
- *  https://<your-app>/api/proxy/https://api.bamboohr.com/...
+ * Usage (any of these):
+ *  https://<your-app>/api/proxy/https://api.bamboohr.com/...        (needs server.mjs)
+ *  https://<your-app>/api/proxy/https%3A%2F%2Fapi.bamboohr.com%2F...  (encodeURIComponent)
+ *  https://<your-app>/api/proxy?url=https%3A%2F%2Fapi.bamboohr.com%2F...
+ *
+ * Next.js 308-redirects paths containing "//" and a preflight can't follow a
+ * redirect, so without server.mjs (e.g. on Vercel) use an encoded form.
  */
 
 export const runtime = "nodejs";
@@ -15,22 +20,42 @@ export const dynamic = "force-dynamic";
 
 const PREFIX = "/api/proxy/";
 
-function corsHeaders(): Record<string, string> {
+function corsHeaders(req: NextRequest): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, X-SPD-Tenant",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+    // Echo whatever the browser asks for so extra client headers don't fail the preflight
+    "Access-Control-Allow-Headers":
+      req.headers.get("access-control-request-headers") ??
+      "Content-Type, Authorization, Accept, X-SPD-Tenant",
+    "Access-Control-Max-Age": "86400",
   };
 }
 
 function parseTarget(req: NextRequest): URL | null {
+  // ?url=<encoded target> form
+  const fromQuery = req.nextUrl.searchParams.get("url");
+  if (fromQuery) {
+    try {
+      return new URL(fromQuery);
+    } catch {
+      return null;
+    }
+  }
+
   // Read from the raw pathname (not params) so percent-encoding is preserved.
-  // Proxies/platforms may collapse "https://" to "https:/" in paths — repair it
   const path = req.nextUrl.pathname;
-  const raw = (path.startsWith(PREFIX) ? path.slice(PREFIX.length) : "").replace(
-    /^(https?):\/(?!\/)/,
-    "$1://",
-  );
+  let raw = path.startsWith(PREFIX) ? path.slice(PREFIX.length) : "";
+  // Fully encoded target: /api/proxy/https%3A%2F%2Fhost%2Fpath
+  if (/^https?%3A/i.test(raw)) {
+    try {
+      raw = decodeURIComponent(raw);
+    } catch {
+      return null;
+    }
+  }
+  // Proxies/platforms may collapse "https://" to "https:/" in paths — repair it
+  raw = raw.replace(/^(https?):\/(?!\/)/, "$1://");
   try {
     return new URL(raw + req.nextUrl.search);
   } catch {
@@ -56,18 +81,18 @@ function getCaller(req: NextRequest): { host: string | null; tenantId: string | 
 }
 
 // Browser preflight (triggered by the Authorization header)
-export function OPTIONS() {
-  return new Response(null, { status: 204, headers: corsHeaders() });
+export function OPTIONS(req: NextRequest) {
+  return new Response(null, { status: 204, headers: corsHeaders(req) });
 }
 
 async function handler(req: NextRequest): Promise<Response> {
   const target = parseTarget(req);
   if (!target) {
-    return new Response("Invalid target URL", { status: 400, headers: corsHeaders() });
+    return new Response("Invalid target URL", { status: 400, headers: corsHeaders(req) });
   }
 
   if (target.protocol !== "https:") {
-    return new Response("Only HTTPS targets are allowed", { status: 403, headers: corsHeaders() });
+    return new Response("Only HTTPS targets are allowed", { status: 403, headers: corsHeaders(req) });
   }
 
   const caller = getCaller(req);
@@ -98,16 +123,23 @@ async function handler(req: NextRequest): Promise<Response> {
     return new Response(nullBody ? null : await res.arrayBuffer(), {
       status: res.status,
       headers: {
-        ...corsHeaders(),
+        ...corsHeaders(req),
         "Content-Type": res.headers.get("content-type") ?? "application/json",
       },
     });
   } catch (err) {
     return new Response(`Upstream request failed: ${(err as Error).message}`, {
       status: 502,
-      headers: corsHeaders(),
+      headers: corsHeaders(req),
     });
   }
 }
 
-export { handler as GET, handler as POST, handler as PUT, handler as DELETE };
+export {
+  handler as GET,
+  handler as HEAD,
+  handler as POST,
+  handler as PUT,
+  handler as PATCH,
+  handler as DELETE,
+};
